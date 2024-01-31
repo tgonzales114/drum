@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# purpose: find all new rpms from a given date
+# assumptions:
+#   - there are log files in the following example tree structure
+#       /var/log/example-data/<DATE_ISO-8601>/<REPO>.txt
+#   - each log file contains all rpms for that repo on that day in full path format
+#   - this script should not be ran as root, it will sudo if needed
+#   - your user can write to the OUTPUT_DIR
+
+set -eu
+declare -A -x TMPDIRS
+export TMPDIRS
+
+function vars() {
+    # configurable environment variables
+    export METADATA_DIR=${METADATA_DIR:-/var/log/example-data}
+    export REPO_BASE_DIR=${REPO_BASE_DIR:-/data/repos}
+    export OUTPUT_DIR=${OUTPUT_DIR:-${REPO_BASE_DIR}/patch-diffs}
+
+    # non-configurable enviroment variables
+    export TODAY=$(date -I)
+    export COMPRESSION_PROGRAMS=(gzip bzip2 xz zip 7z zstd)
+}
+
+function deps() {
+    # install gum
+    if ! which gum &>/dev/null; then
+        echo "NOTICE: gum not installed, installing now"
+    else
+        return 0
+    fi
+
+    echo '[charm]
+    name=Charm
+    baseurl=https://repo.charm.sh/yum/
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://repo.charm.sh/yum/gpg.key' | sed 's/^ *//' | sudo tee /etc/yum.repos.d/charm.repo >/dev/null
+    echo "NOTICE: added repo for gum at /etc/yum.repos.d/charm.repo"
+
+    if which dnf &>/dev/null; then
+        sudo dnf install -y gum
+    elif which yum &>/dev/null; then
+        sudo yum install -y gum
+    else
+        echo "ERROR: could not install gum, exiting"
+        exit 1
+    fi
+
+    echo "INFO: finished installing gum"
+}
+
+function get_start() {
+    START_CHOICES=$(find $METADATA_DIR -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+    export START_DATE=$(echo "$START_CHOICES" | gum filter --height 14 --header "how far back?")
+    if ! date -d $START_DATE &>/dev/null; then
+        echo "ERROR: this is not a valid date, exiting"
+        exit 1
+    fi
+}
+
+function get_repos_with_updates() {
+    # get all repos from today
+    ALL_CURRENT_FILES=$(find ${METADATA_DIR}/${TODAY}/ -mindepth 1 -maxdepth 1 -type f -exec basename {} \;)
+    export REPOS_WITH_UPDATES=()
+    REPOS_WITH_UPDATES+=("all")
+    REPOS_WITH_UPDATES+=("none")
+
+    # for each repo
+    for FILE in ${ALL_CURRENT_FILES[@]}; do
+        REPO=$(echo $FILE | sed 's/.txt//')
+        #echo "INFO: checking repo $REPO"
+        CURRENT_FILE=${METADATA_DIR}/${TODAY}/$FILE
+        START_FILE=${METADATA_DIR}/${START_DATE}/$FILE
+
+        # create tmp data
+        TMPDIR=$(mktemp -d)
+        TMPDIRS[$REPO]=$TMPDIR
+        trap cleanup SIGINT EXIT ERR
+        START_FILE_SORTED=$TMPDIR/${START_DATE}-${FILE}.sorted
+        CURRENT_FILE_SORTED=$TMPDIR/${TODAY}-${FILE}.sorted
+        sort -n $START_FILE > $START_FILE_SORTED
+        sort -n $CURRENT_FILE > $CURRENT_FILE_SORTED
+
+        # are there any new files?
+        NEW_FILES=($(comm -13 $START_FILE_SORTED $CURRENT_FILE_SORTED))
+        if [[ "${#NEW_FILES[@]}" != 0 ]]; then
+            REPOS_WITH_UPDATES+=("$REPO")
+        fi
+    done
+}
+
+function get_repo_selection() {
+    REPO_SELECTION=$(printf '%s\n' "${REPOS_WITH_UPDATES[@]}" | gum choose --limit ${#REPOS_WITH_UPDATES[@]} --header "The following repos have updates, which would you like to archive?")
+    export REPOS_TO_ARCHIVE=()
+    for REPO in ${REPO_SELECTION[@]}; do
+        if [[ "$REPO" == "none" ]]; then
+            echo "NOTICE: repo selection 'none' detected, exiting"
+            exit
+        elif [[ "$REPO" == "all" ]]; then
+            REPOS_TO_ARCHIVE=(${REPOS_WITH_UPDATES[@]:2})
+            return
+        else
+            REPOS_TO_ARCHIVE+=("$REPO")
+        fi
+    done
+
+    if [[ ${#REPOS_TO_ARCHIVE[@]} == "0" ]]; then
+        echo "ERROR: nothing was selected, try again"
+        get_repo_selection
+    fi
+}
+
+function archive_repos() {
+    echo "NOTICE: the following repos will be archived:"
+    printf '  - %s\n' ${REPOS_TO_ARCHIVE[@]}
+
+    export ARCHIVE=${OUTPUT_DIR}/disconnected-rpm-update-from-${START_DATE}-to-${TODAY}.tar
+
+    for REPO in ${REPOS_TO_ARCHIVE[@]}; do
+        echo "INFO: archiving repo $REPO..."
+        # reference existing tmp data
+        TMPDIR=${TMPDIRS[$REPO]}
+        START_FILE_SORTED=$TMPDIR/${START_DATE}-${REPO}.txt.sorted
+        CURRENT_FILE_SORTED=$TMPDIR/${TODAY}-${REPO}.txt.sorted
+
+        # get new files
+        NEW_FILES=($(comm -13 $START_FILE_SORTED $CURRENT_FILE_SORTED))
+        if [[ "${#NEW_FILES[@]}" != 0 ]]; then
+            for FILE in ${NEW_FILES[@]}; do
+                FILE_NAME=$(basename $FILE)
+                FILE_PATH_RELATIVE=$(echo $FILE | sed "s#${REPO_BASE_DIR}/##")
+
+                # add file to archive with relative path
+                tar -C $REPO_BASE_DIR --append --file=$ARCHIVE $FILE_PATH_RELATIVE
+            done
+        fi
+
+        # add repo metadata
+        tar -C $REPO_BASE_DIR --append --file=$ARCHIVE ${REPO}/repodata
+
+    done
+
+    echo "INFO: archive created at $ARCHIVE"
+}
+
+function compress_archive_choose() {
+    COMPRESS_BOOL=$(gum choose --header "would you like to compress the archive?" "Yes" "No")
+
+    if [[ "$COMPRESS_BOOL" == "No" ]]; then
+        exit
+    fi
+}
+
+function compress_archive_check() {
+    export PROGRAM=$(printf '%s\n' "${COMPRESSION_PROGRAMS[@]}" | sort -n | gum choose --header "which program?")
+
+    if ! which $PROGRAM &>/dev/null; then
+        echo "ERROR: could not find $PROGRAM installed, try again"
+        compress_archive_check
+    fi
+}
+
+function compress_archive() {
+    if [[ "$PROGRAM" == "bzip2" ]]; then
+        CMD="$PROGRAM $ARCHIVE"
+        OUTPUT=${ARCHIVE}.bz2
+    elif [[ "$PROGRAM" == "gzip" ]]; then
+        CMD="$PROGRAM $ARCHIVE"
+        OUTPUT=${ARCHIVE}.gz
+    elif [[ "$PROGRAM" == "xz" ]]; then
+        CMD="$PROGRAM $ARCHIVE"
+        OUTPUT=${ARCHIVE}.xz
+    #elif [[ "$PROGRAM" == "zip" ]]; then
+        #OUTPUT=${ARCHIVE}.zip
+        #CMD="$PROGRAM -rm $ARCHIVE $OUTPUT"
+    elif [[ "$PROGRAM" == "zstd" ]]; then
+        CMD="$PROGRAM --rm $ARCHIVE"
+        OUTPUT=${ARCHIVE}.zst
+    #elif [[ "$PROGRAM" == "7z" ]]; then
+        #:
+    else
+        echo "ERROR: compression program $PROGRAM is not supported"
+        exit 1
+    fi
+
+    echo "INFO: compressing archive..."
+    $CMD
+    echo "INFO: compressed archive at $OUTPUT"
+}
+
+function cleanup() {
+    if [[ "${#TMPDIRS[@]}" != "0" ]]; then
+        for REPO in ${!TMPDIRS[@]}; do
+            TMPDIR=${TMPDIRS[$REPO]}
+            rm ${TMPDIR}/*
+            rmdir $TMPDIR
+        done
+    fi
+}
+
+function main() {
+    vars
+    deps
+    get_start
+    get_repos_with_updates
+    get_repo_selection
+    archive_repos
+    compress_archive_choose
+    compress_archive_check
+    compress_archive
+}
+
+main
