@@ -61,34 +61,49 @@ function get_start() {
 }
 
 function get_repos_with_updates() {
-    # get all repos from today
-    ALL_CURRENT_FILES=$(find ${METADATA_DIR}/${TODAY}/ -mindepth 1 -maxdepth 1 -type f -exec basename {} \;)
+    # get all repos in repo base dir
+    ALL_REPOS=($(find ${REPO_BASE_DIR}/ -mindepth 1 -maxdepth 1 -type d -exec basename {} \;))
+
     export REPOS_WITH_UPDATES=()
     REPOS_WITH_UPDATES+=("all")
     REPOS_WITH_UPDATES+=("none")
 
     # for each repo
-    for FILE in ${ALL_CURRENT_FILES[@]}; do
-        REPO=$(echo $FILE | sed 's/.txt//')
-        #echo "INFO: checking repo $REPO"
-        CURRENT_FILE=${METADATA_DIR}/${TODAY}/$FILE
-        START_FILE=${METADATA_DIR}/${START_DATE}/$FILE
+    for REPO in ${ALL_REPOS[@]}; do
+        CURRENT_FILE=${METADATA_DIR}/${TODAY}/${REPO}.txt
+        START_FILE=${METADATA_DIR}/${START_DATE}/${REPO}.txt
+
+        if [[ ! -f "$CURRENT_FILE" ]]; then
+            echo "WARNING: repo $REPO does not have the metadata file $CURRENT_FILE and will not be used"
+            continue
+        fi
+
+        if [[ ! -f "$START_FILE" ]]; then
+            echo "WARNING: repo $REPO does not have the metadata file $START_FILE and will not be used"
+            continue
+        fi
 
         # create tmp data
         TMPDIR=$(mktemp -d)
         TMPDIRS[$REPO]=$TMPDIR
         trap cleanup SIGINT EXIT ERR
-        START_FILE_SORTED=$TMPDIR/${START_DATE}-${FILE}.sorted
-        CURRENT_FILE_SORTED=$TMPDIR/${TODAY}-${FILE}.sorted
+        START_FILE_SORTED=$TMPDIR/${START_DATE}-${REPO}.txt.sorted
+        CURRENT_FILE_SORTED=$TMPDIR/${TODAY}-${REPO}.txt.sorted
         sort -n $START_FILE > $START_FILE_SORTED
         sort -n $CURRENT_FILE > $CURRENT_FILE_SORTED
 
         # are there any new files?
         NEW_FILES=($(comm -13 $START_FILE_SORTED $CURRENT_FILE_SORTED))
-        if [[ "${#NEW_FILES[@]}" != 0 ]]; then
+        if [[ "${#NEW_FILES[@]}" != "0" ]]; then
             REPOS_WITH_UPDATES+=("$REPO")
         fi
     done
+
+    if [[ "${#REPOS_WITH_UPDATES[@]}" == "2" ]]; then
+        echo "ERROR: there were no repos with updates, exiting"
+        exit
+    fi
+
 }
 
 function get_repo_selection() {
