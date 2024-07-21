@@ -12,6 +12,19 @@ set -eu
 declare -A -x TMPDIRS
 export TMPDIRS
 
+function usage() {
+    echo "Disconnected RPM Update Manager (drum):"
+    echo "usage: $0 [-hz] [-Z COMPRESSION] -s START -r REPOSITORIES"
+    echo "example: $0 -z -Z zstd -s 2024-07-01 -r baseos,appstream,epel"
+    echo "options:"
+    echo "  -h              show this help message"
+    echo "  -s START        start date to use for the disconnected update"
+    echo "  -r REPOSITORIES comma seperated list of repositories to use for the disconnected update"
+    echo "  -z              compress the disconnected update file"
+    echo "  -Z COMPRESSION  compression method to use"
+    exit 1
+}
+
 function vars() {
     # configurable environment variables
     export METADATA_DIR=${METADATA_DIR:-/var/log/example-data}
@@ -21,6 +34,24 @@ function vars() {
     # non-configurable enviroment variables
     export TODAY=$(date -I)
     export COMPRESSION_PROGRAMS=(gzip bzip2 xz zip 7z zstd)
+
+    # argument defaults
+    export INPUT_COMPRESS=false
+}
+
+function args() {
+    # parse arguments passed to script
+    while getopts ':hzZ:s:r:' OPTION; do
+        case $OPTION in
+            h) usage;;
+            z) export INPUT_COMPRESS=true;;
+            Z) export INPUT_COMPRESSION=$OPTARG;;
+            s) export INPUT_START_DATE=$OPTARG;;
+            r) export INPUT_REPOSITORIES=$OPTARG;;
+            :) echo "ERROR: option -$OPTARG requires an argument"; usage;;
+            \?) echo "ERROR: unknown option -$OPTARG"; usage;;
+        esac
+    done
 }
 
 function deps() {
@@ -45,17 +76,24 @@ function deps() {
         sudo yum install -y gum
     else
         echo "ERROR: could not install gum, exiting"
-        exit 1
+        usage
     fi
 
     echo "INFO: finished installing gum"
 }
 
 function get_start() {
-    START_CHOICES=$(find $METADATA_DIR -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
-    export START_DATE=$(echo "$START_CHOICES" | gum filter --height 14 --header "how far back?")
+    set +u
+    if [[ -z "$INPUT_START_DATE" ]]; then
+        START_CHOICES=$(find $METADATA_DIR -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+        export START_DATE=$(echo "$START_CHOICES" | gum filter --height 14 --header "how far back?")
+    else
+        export START_DATE=$INPUT_START_DATE
+    fi
+    set -e
+
     if ! date -d $START_DATE &>/dev/null; then
-        echo "ERROR: this is not a valid date, exiting"
+        echo "ERROR: $START_DATE is not a valid date, exiting"
         exit 1
     fi
 }
@@ -197,7 +235,7 @@ function compress_archive() {
         #:
     else
         echo "ERROR: compression program $PROGRAM is not supported"
-        exit 1
+        usage
     fi
 
     echo "INFO: compressing archive..."
@@ -217,6 +255,7 @@ function cleanup() {
 
 function main() {
     vars
+    args $@
     deps
     get_start
     get_repos_with_updates
@@ -227,4 +266,4 @@ function main() {
     compress_archive
 }
 
-main
+main $@
